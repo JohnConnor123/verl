@@ -202,14 +202,23 @@ class vLLMAsyncRollout(BaseRollout):
 
         if not torch.distributed.is_initialized():
             initialize_global_process_group_ray()
-        all_kwargs[0]["rank"] = int(os.environ["RANK"])
+        rank = int(os.environ["RANK"])
+        all_kwargs[0]["rank"] = rank
         device_name = "NPU" if is_npu_available else "GPU"
-        all_kwargs[0]["local_rank"] = (
-            0
-            if not ray_noset_visible_devices()
-            else int(ray.get_runtime_context().get_accelerator_ids()[device_name][0])
-        )
         self.vllm_config = all_kwargs[0]["vllm_config"]
+
+        if not ray_noset_visible_devices():
+            all_kwargs[0]["local_rank"] = 0
+        else:
+            parallel_config = self.vllm_config.parallel_config
+            if getattr(parallel_config, "data_parallel_size", 1) > 1:
+                tp = getattr(parallel_config, "tensor_parallel_size", 1)
+                pp = getattr(parallel_config, "pipeline_parallel_size", 1)
+                all_kwargs[0]["local_rank"] = rank % (tp * pp)
+            else:
+                all_kwargs[0]["local_rank"] = int(
+                    ray.get_runtime_context().get_accelerator_ids()[device_name][0]
+                )
         if self.lora_config:
             lora_dtype = getattr(torch, self.config.dtype)
             self.vllm_config.lora_config = LoRAConfig(lora_dtype=lora_dtype, **self.lora_config)
