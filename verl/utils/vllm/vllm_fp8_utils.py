@@ -51,6 +51,39 @@ class FP8State:
 
 fp8_state: FP8State = FP8State()
 
+def _maybe_init_marlin_workspace(model: torch.nn.Module) -> None:
+    """Best-effort shim for vLLM FP8 (Marlin).
+
+    Some vLLM Marlin FP8 codepaths assume certain linear layers have a
+    `workspace` attribute and lazily allocate it on first use. In some model
+    variants (e.g., QKVParallelLinear), that attribute may be missing, causing:
+      AttributeError: '<...>' object has no attribute 'workspace'
+
+    We keep this shim intentionally narrow and lazy:
+    - only touches modules named 'QKVParallelLinear'
+    - sets `workspace=None` (no allocation)
+    - idempotent (only when missing)
+    """
+    patched = 0
+    for module in model.modules():
+        if module.__class__.__name__ != "QKVParallelLinear":
+            continue
+        if hasattr(module, "workspace"):
+            continue
+        setattr(module, "workspace", None)
+        patched += 1
+
+    def _is_rank0() -> bool:
+        try:
+            if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+                return True
+            return torch.distributed.get_rank() == 0
+        except Exception:
+            return True
+
+    if patched and _is_rank0():
+        logger.info(f"vLLM FP8 (Marlin): initialized missing workspace attr for {patched} QKVParallelLinear modules")
+
 
 def is_fp8_model(vllm_config):
     from vllm.model_executor.layers.quantization.fp8 import Fp8Config
@@ -176,6 +209,13 @@ def load_quanted_weights(weights, model_runner):
     for name, param in model.named_parameters():
         if hasattr(param, "subclass_type"):
             param.__class__ = param.orig_type
+
+    # vLLM FP8 (Marlin) workspace shim (lazy + idempotent).
+    try:
+        _maybe_init_marlin_workspace(model)
+    except Exception as e:
+        # Best-effort: do not fail weight loading due to the shim.
+        logger.debug(f"vLLM FP8 (Marlin): workspace shim failed: {e}")
     return loaded_params
 
 
@@ -431,6 +471,11 @@ def process_weights_after_loading_moe_for_vllm11(self, layer) -> None:
 
 
 def apply_vllm_fp8_patches():
+    # Idempotency: some callsites may invoke this multiple times.
+    if fp8_state.vllm_patches:
+        logger.debug("vLLM FP8 patches already applied; skipping")
+        return
+
     logger.info("Applying vllm fp8 patches for blockwise quantization")
     func1_path = "vllm.model_executor.layers.quantization.fp8.Fp8LinearMethod.process_weights_after_loading"
     patcher1 = patch(
@@ -448,3 +493,5 @@ def apply_vllm_fp8_patches():
         else process_weights_after_loading_moe_for_vllm10,
     )
     patcher2.start()
+
+    fp8_state.vllm_patches.extend([patcher1, patcher2])
