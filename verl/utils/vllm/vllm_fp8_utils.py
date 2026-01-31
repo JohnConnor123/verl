@@ -15,7 +15,6 @@
 
 import logging
 from dataclasses import dataclass, field
-import importlib
 from unittest.mock import patch
 
 import torch
@@ -92,41 +91,6 @@ def _make_post_load_wrapper(orig_fn, param_names: list[str], *, name: str):
 
     _wrapped.__name__ = name
     return _wrapped
-
-
-def _patch_vllm_qkvparallellinear_workspace_attr() -> None:
-    """Patch vLLM's QKVParallelLinear to have a lazy `workspace` attr.
-
-    vLLM FP8 (Marlin) may access `layer.workspace` during profiling/first runs
-    and lazily allocate it when needed. If the attribute is missing, vLLM can
-    crash with an AttributeError.
-
-    This patch is intentionally narrow and idempotent:
-    - targets vLLM's `QKVParallelLinear` class only
-    - sets `workspace=None` when missing (no allocation)
-    - guarded by a per-class sentinel to avoid patching multiple times
-    """
-    try:
-        mod = importlib.import_module("vllm.model_executor.layers.linear")
-        cls = getattr(mod, "QKVParallelLinear", None)
-    except Exception:
-        cls = None
-
-    if cls is None:
-        return
-    if getattr(cls, "_verl_fp8_workspace_shim_applied", False):
-        return
-
-    orig_init = cls.__init__
-
-    def _wrapped_init(self, *args, **kwargs):
-        orig_init(self, *args, **kwargs)
-        if not hasattr(self, "workspace"):
-            self.workspace = None
-
-    cls.__init__ = _wrapped_init
-    cls._verl_fp8_workspace_shim_applied = True
-    logger.info("vLLM FP8 (Marlin): applied QKVParallelLinear workspace shim")
 
 
 def is_fp8_model(vllm_config):
@@ -514,7 +478,6 @@ def apply_vllm_fp8_patches():
         return
 
     logger.info("Applying vllm fp8 patches for blockwise quantization")
-    _patch_vllm_qkvparallellinear_workspace_attr()
 
     vllm_ver = version.parse(vllm.__version__)
     is_vllm_12_or_later = vllm_ver >= version.parse("0.12.0")
