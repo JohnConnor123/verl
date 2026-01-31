@@ -52,6 +52,76 @@ class FP8State:
 
 fp8_state: FP8State = FP8State()
 
+_ORIG_FP8_LINEAR_PROCESS_WEIGHTS_AFTER_LOADING = None
+_ORIG_FP8_MOE_PROCESS_WEIGHTS_AFTER_LOADING = None
+
+
+def _copy_custom_parameter_attrs(src: object, dst: object) -> None:
+    """Best-effort copy of custom attrs (e.g., weight_loader) across Parameters."""
+    if src is None or dst is None:
+        return
+    try:
+        base_param_dir = set(dir(torch.nn.Parameter))
+        for attr in dir(src):
+            if attr in base_param_dir or attr.startswith("__"):
+                continue
+            # Skip some common/unsafe attributes.
+            if attr in {"data", "grad"}:
+                continue
+            try:
+                setattr(dst, attr, getattr(src, attr))
+            except Exception:
+                continue
+    except Exception:
+        return
+
+
+def process_weights_after_loading_for_vllm12(self, layer) -> None:
+    """vLLM>=0.12 wrapper: keep vLLM-native behavior, restore custom attrs.
+
+    vLLM 0.12 may (correctly) initialize Marlin workspace during its native
+    post-load processing. We therefore call the original vLLM method and only
+    restore custom Parameter attributes that are important for refit (e.g.,
+    weight_loader) and can be lost if vLLM recreates Parameter objects.
+    """
+    global _ORIG_FP8_LINEAR_PROCESS_WEIGHTS_AFTER_LOADING
+    if _ORIG_FP8_LINEAR_PROCESS_WEIGHTS_AFTER_LOADING is None:
+        raise RuntimeError("Original vLLM FP8 process_weights_after_loading is not initialized")
+
+    old_weight = getattr(layer, "weight", None)
+    old_weight_scale = getattr(layer, "weight_scale", None)
+    old_weight_scale_inv = getattr(layer, "weight_scale_inv", None)
+    old_input_scale = getattr(layer, "input_scale", None)
+
+    _ORIG_FP8_LINEAR_PROCESS_WEIGHTS_AFTER_LOADING(self, layer)
+
+    _copy_custom_parameter_attrs(old_weight, getattr(layer, "weight", None))
+    _copy_custom_parameter_attrs(old_weight_scale, getattr(layer, "weight_scale", None))
+    _copy_custom_parameter_attrs(old_weight_scale_inv, getattr(layer, "weight_scale_inv", None))
+    _copy_custom_parameter_attrs(old_input_scale, getattr(layer, "input_scale", None))
+
+
+def process_weights_after_loading_moe_for_vllm12(self, layer) -> None:
+    """vLLM>=0.12 wrapper (MoE): keep vLLM-native behavior, restore custom attrs."""
+    global _ORIG_FP8_MOE_PROCESS_WEIGHTS_AFTER_LOADING
+    if _ORIG_FP8_MOE_PROCESS_WEIGHTS_AFTER_LOADING is None:
+        raise RuntimeError("Original vLLM FP8 MoE process_weights_after_loading is not initialized")
+
+    old_params = {
+        "w13_weight": getattr(layer, "w13_weight", None),
+        "w13_weight_scale_inv": getattr(layer, "w13_weight_scale_inv", None),
+        "w2_weight": getattr(layer, "w2_weight", None),
+        "w2_weight_scale_inv": getattr(layer, "w2_weight_scale_inv", None),
+        "weight_scale": getattr(layer, "weight_scale", None),
+        "weight_scale_inv": getattr(layer, "weight_scale_inv", None),
+    }
+
+    _ORIG_FP8_MOE_PROCESS_WEIGHTS_AFTER_LOADING(self, layer)
+
+    for k, old in old_params.items():
+        _copy_custom_parameter_attrs(old, getattr(layer, k, None))
+
+
 def _patch_vllm_qkvparallellinear_workspace_attr() -> None:
     """Patch vLLM's QKVParallelLinear to have a lazy `workspace` attr.
 
